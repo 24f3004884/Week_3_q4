@@ -4,6 +4,7 @@ from sqlalchemy import Text
 
 from app.database import Base
 
+
 class Run(Base):
 
     __tablename__ = "runs"
@@ -12,5 +13,7 @@ class Run(Base):
         String,
         primary_key=True
     )
+
+    request_hash = Column(String)
 
     state_json = Column(Text)

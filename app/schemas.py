@@ -1,9 +1,17 @@
 from pydantic import BaseModel
-from typing import Dict
-from typing import List
+from typing import Dict, List
+
+
+class Incident(BaseModel):
+    incidentId: str
+    title: str
+    service: str
+    severity: str
+    transcript: str
+    allowedRootCauses: List[str]
+
 
 class IncidentRequest(BaseModel):
-
     profile: str
     runId: str
     agentName: str
@@ -11,7 +19,7 @@ class IncidentRequest(BaseModel):
 
     sensitive: Dict
 
-    incident: Dict
+    incident: Incident
 
     toolCatalog: List[Dict]
 
