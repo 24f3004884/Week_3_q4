@@ -1,242 +1,142 @@
-from fastapi import FastAPI
-from fastapi import HTTPException
-
-from sqlalchemy.orm import Session
-
-from app.database import *
-from app.models import *
-from app.schemas import *
-
-import hashlib
+import asyncio
 import json
-import re
-import secrets
+from collections import defaultdict
+
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import Response
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from . import config, machine, planner, store, trace
+from .util import canon, dumps, now_ns, sha256_hex
+
+app = FastAPI(redirect_slashes=False, docs_url=None, redoc_url=None, openapi_url=None)
+_locks = defaultdict(asyncio.Lock)
 
 
-SUPPORTED_PROFILE = "ga5-incident-agent/v2"
-
-app = FastAPI()
-
-Base.metadata.create_all(bind=engine)
+def jtext(text, status=200):
+    return Response(content=text.encode("utf-8"), status_code=status, media_type="application/json")
 
 
-def make_hash(data):
-
-    return hashlib.sha256(
-        json.dumps(
-            data,
-            sort_keys=True
-        ).encode()
-    ).hexdigest()
+def err(status, msg):
+    return jtext(dumps({"error": msg}), status)
 
 
-def extract_evidence_ids(transcript):
-
-    matches = re.findall(
-        r"\[(.*?)\]",
-        transcript
-    )
-
-    return matches[:4]
+@app.exception_handler(RequestValidationError)
+async def _v(_r, _e):
+    return err(422, "invalid request")
 
 
-def build_traceparent():
-
-    trace_id = secrets.token_hex(16)
-    span_id = secrets.token_hex(8)
-
-    return f"00-{trace_id}-{span_id}-01"
+@app.exception_handler(StarletteHTTPException)
+async def _h(_r, e):
+    return err(e.status_code, "error")
 
 
-def build_dispatch(tool_name, service, evidence):
+@app.exception_handler(Exception)
+async def _x(_r, _e):
+    return err(500, "internal error")
 
-    action_id = secrets.token_hex(8)
-    call_id = secrets.token_hex(8)
 
-    return {
-        "actionId": action_id,
-        "callId": call_id,
-        "phase": "diagnostic",
-        "toolName": tool_name,
-        "arguments": {
-            "service": service
-        },
-        "evidence": evidence[:1],
-        "attempt": 1,
-        "traceparent": build_traceparent()
-    }
+def _validate_request(b):
+    if b.get("profile") != config.PROFILE:
+        return 400, "unsupported profile"
+    for k in ("runId", "agentName", "publicMarker"):
+        if not isinstance(b.get(k), str) or not b[k].strip():
+            return 422, f"invalid {k}"
+    inc, pol = b.get("incident"), b.get("policy")
+    if not isinstance(inc, dict) or not isinstance(inc.get("transcript"), str) or not inc["transcript"].strip():
+        return 422, "invalid incident"
+    arc = inc.get("allowedRootCauses")
+    if not isinstance(arc, list) or not arc or not all(isinstance(x, str) for x in arc):
+        return 422, "invalid allowedRootCauses"
+    cat = b.get("toolCatalog")
+    if not isinstance(cat, list) or not cat or not all(isinstance(t, dict) and isinstance(t.get("name"), str) for t in cat):
+        return 422, "invalid toolCatalog"
+    if not isinstance(pol, dict):
+        return 422, "invalid policy"
+    eff = pol.get("effectTools")
+    names = {t["name"] for t in cat}
+    if not isinstance(eff, list) or not any(e in names for e in eff):
+        return 422, "invalid effectTools"
+    if "sensitive" in b and not isinstance(b["sensitive"], dict):
+        return 422, "invalid sensitive"
+    return None
+
+
+async def _json_body(request):
+    try:
+        body = json.loads(await request.body())
+    except Exception:
+        return None
+    return body if isinstance(body, dict) else None
 
 
 @app.get("/")
-def root():
-
-    return {
-        "status": "ok"
-    }
+@app.get("/healthz")
+async def health():
+    return jtext(dumps({"ok": True}))
 
 
 @app.post("/v2/incidents")
-def create_incident(
-        request: IncidentRequest):
-
-    if request.profile != SUPPORTED_PROFILE:
-
-        raise HTTPException(
-            status_code=422,
-            detail="Unsupported profile"
-        )
-
-    db: Session = SessionLocal()
-
-    request_dict = request.model_dump()
-
-    request_hash = make_hash(
-        request_dict
-    )
-
-    existing = db.get(
-        Run,
-        request.runId
-    )
-
-    #
-    # Replay handling
-    #
-
-    if existing:
-
-        if existing.request_hash != request_hash:
-
-            raise HTTPException(
-                status_code=409,
-                detail="runId reused with different content"
-            )
-
-        return json.loads(
-            existing.state_json
-        )
-
-    transcript = request.incident.transcript
-
-    evidence_ids = extract_evidence_ids(
-        transcript
-    )
-
-    root_cause = (
-        request.incident.allowedRootCauses[0]
-        if request.incident.allowedRootCauses
-        else "unknown"
-    )
-
-    dispatches = []
-
-    if request.toolCatalog:
-
-        tool_name = request.toolCatalog[0]["name"]
-
-        dispatches.append(
-            build_dispatch(
-                tool_name,
-                request.incident.service,
-                evidence_ids
-            )
-        )
-
-    response = {
-        "runId": request.runId,
-        "status": "waiting",
-        "diagnosis": {
-            "rootCause": root_cause,
-            "evidence": evidence_ids[:2]
-        },
-        "dispatches": dispatches,
-        "approvals": []
-    }
-
-    db.add(
-        Run(
-            run_id=request.runId,
-            request_hash=request_hash,
-            state_json=json.dumps(response)
-        )
-    )
-
-    db.commit()
-
-    return response
+async def create_incident(request: Request):
+    t_start = now_ns()
+    body = await _json_body(request)
+    if body is None:
+        return err(400, "invalid json")
+    run_id = body.get("runId")
+    if not isinstance(run_id, str) or not run_id.strip() or len(run_id) > 512:
+        return err(422, "invalid runId")
+    h = sha256_hex(canon(body))
+    async with _locks[run_id]:
+        ex = store.get_idem(run_id, "POST")
+        if ex:
+            return jtext(ex[1]) if ex[0] == h else err(409, "conflict")
+        bad = _validate_request(body)
+        if bad:
+            return err(*bad)
+        ctx = trace.make_context(body, request.headers)
+        plan_start = now_ns()
+        try:
+            plan = await planner.make_plan(body)
+        except Exception:
+            return err(502, "planner unavailable")
+        plan_end = now_ns()
+        times = {"start": t_start, "planStart": plan_start, "planEnd": plan_end, "end": None}
+        state, resp = machine.start_run(body, plan, ctx, config.LLM_MODEL, config.LLM_PROVIDER, times)
+        text = dumps(resp)
+        store.commit(run_id, state, "POST", h, text)
+        return jtext(text)
 
 
-@app.post(
-    "/v2/incidents/{run_id}/receipts"
-)
-def process_receipt(
-        run_id: str,
-        body: dict):
-
-    db: Session = SessionLocal()
-
-    run = db.get(
-        Run,
-        run_id
-    )
-
-    if not run:
-
-        raise HTTPException(
-            status_code=404,
-            detail="Run not found"
-        )
-
-    state = json.loads(
-        run.state_json
-    )
-
-    state["status"] = "completed"
-
-    state["chosenEffect"] = None
-
-    state["actionLog"] = state.get(
-        "dispatches",
-        []
-    )
-
-    state["receiptLog"] = [
-        {
-            "receiptId": body.get(
-                "receiptId",
-                "unknown"
-            )
-        }
-    ]
-
-    run.state_json = json.dumps(
-        state
-    )
-
-    db.commit()
-
-    return state
+@app.post("/v2/incidents/{run_id}/receipts")
+async def post_receipt(run_id: str, request: Request):
+    body = await _json_body(request)
+    if body is None:
+        return err(400, "invalid json")
+    rid = body.get("receiptId")
+    if not isinstance(rid, str) or not rid.strip() or len(rid) > 512:
+        return err(422, "invalid receiptId")
+    h = sha256_hex(canon(body))
+    async with _locks[run_id]:
+        state = store.get_state(run_id)
+        if state is None:
+            return err(404, "run not found")
+        key = "receipt:" + rid
+        ex = store.get_idem(run_id, key)
+        if ex:
+            return jtext(ex[1]) if ex[0] == h else err(409, "conflict")
+        try:
+            new_state, resp = machine.apply_receipt(state, body, now_ns())
+        except machine.Invalid as e:
+            return err(e.code, e.msg)
+        text = dumps(resp)
+        store.commit(run_id, new_state, key, h, text)
+        return jtext(text)
 
 
-@app.get(
-    "/v2/incidents/{run_id}"
-)
-def get_run(run_id: str):
-
-    db: Session = SessionLocal()
-
-    run = db.get(
-        Run,
-        run_id
-    )
-
-    if not run:
-
-        raise HTTPException(
-            status_code=404,
-            detail="Run not found"
-        )
-
-    return json.loads(
-        run.state_json
-    )
+@app.get("/v2/incidents/{run_id}")
+async def get_incident(run_id: str):
+    state = store.get_state(run_id)
+    if state is None:
+        return err(404, "run not found")
+    return jtext(dumps(state["view"]))
