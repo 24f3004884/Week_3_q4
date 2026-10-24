@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from collections import defaultdict
 
 from fastapi import FastAPI, Request
@@ -12,6 +13,7 @@ from .util import canon, dumps, now_ns, sha256_hex
 
 app = FastAPI(redirect_slashes=False, docs_url=None, redoc_url=None, openapi_url=None)
 _locks = defaultdict(asyncio.Lock)
+log = logging.getLogger("uvicorn.error")
 
 
 def jtext(text, status=200):
@@ -98,9 +100,11 @@ async def create_incident(request: Request):
         plan_start = now_ns()
         try:
             plan = await planner.make_plan(body)
-        except Exception:
+        except Exception as e:
+            log.error("planner crashed run=%s %s", run_id, type(e).__name__)
             return err(502, "planner unavailable")
         plan_end = now_ns()
+        log.info("POST run=%s planned in %.1fs", run_id, (plan_end - plan_start) / 1e9)
         times = {"start": t_start, "planStart": plan_start, "planEnd": plan_end, "end": None}
         state, resp = machine.start_run(body, plan, ctx, config.LLM_MODEL, config.LLM_PROVIDER, times)
         text = dumps(resp)
@@ -131,6 +135,7 @@ async def post_receipt(run_id: str, request: Request):
             return err(e.code, e.msg)
         text = dumps(resp)
         store.commit(run_id, new_state, key, h, text)
+        log.info("RECEIPT run=%s id=%s -> %s", run_id, rid, resp.get("status"))
         return jtext(text)
 
 

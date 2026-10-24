@@ -13,7 +13,8 @@ LLM_MODEL = os.getenv("LLM_MODEL", "")
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "")
 FAKE_LLM = os.getenv("FAKE_LLM") == "1"
 PROFILE = "ga5-incident-agent/v2"
-AGENT_DEADLINE_S = 15.0
+AGENT_DEADLINE_S = 13.0
+MODEL_BUDGET_S = float(os.getenv("MODEL_BUDGET_S", "12.5"))
 
 DATA_DIR = Path(os.getenv("DATA_DIR", ""))
 try:

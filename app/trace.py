@@ -34,11 +34,31 @@ def valid_tracestate(v):
     return True
 
 
+def _find(o, key, depth=0):
+    if depth > 4:
+        return None
+    if isinstance(o, dict):
+        for k, v in o.items():
+            if k != "sensitive" and isinstance(k, str) and k.lower() == key and isinstance(v, str):
+                return v
+        for k, v in o.items():
+            if k != "sensitive":
+                r = _find(v, key, depth + 1)
+                if r:
+                    return r
+    elif isinstance(o, list):
+        for v in o:
+            r = _find(v, key, depth + 1)
+            if r:
+                return r
+    return None
+
+
 def make_context(body, headers):
     tp, ts = headers.get("traceparent"), headers.get("tracestate")
     parsed = parse_traceparent(tp)
     if not parsed:
-        tp, ts = body.get("traceparent"), body.get("tracestate")
+        tp, ts = _find(body, "traceparent"), _find(body, "tracestate")
         parsed = parse_traceparent(tp)
     ctx = {"serverSpanId": new_hex(8)}
     if parsed:
@@ -200,3 +220,5 @@ def build_otlp(state):
             }
         ]
     }
+
+
